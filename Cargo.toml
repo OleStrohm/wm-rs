@@ -1,0 +1,12 @@
+[package]
+name = "wm-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+
+[dependencies]
+x11 = { version = "2.19.1", features = ["xlib"] }
+
+[target.x86_64-unknown-linux-gnu.runner]
+runner = "./runner.sh"
