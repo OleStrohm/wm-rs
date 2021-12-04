@@ -1,27 +1,37 @@
 use log::{error, info, trace, warn};
 use std::ffi::{c_void, CStr};
 use std::mem::MaybeUninit;
+use std::os::raw::c_uint;
+use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use x11::keysym::{XK_Tab, XK_space, XK_Q};
 use x11::xlib::{
-    BadAccess, ConfigureNotify, ConfigureRequest, CreateNotify, DestroyNotify, Display,
-    GrabModeAsync, IsViewable, KeyPress, KeyRelease, MapRequest, Mod1Mask, ReparentNotify,
-    SubstructureNotifyMask, SubstructureRedirectMask, UnmapNotify, Window, XAddToSaveSet,
-    XCloseDisplay, XConfigureEvent, XConfigureRequestEvent, XConfigureWindow, XCreateSimpleWindow,
-    XCreateWindowEvent, XDefaultRootWindow, XDestroyWindow, XDestroyWindowEvent, XDisplayName,
-    XDisplayString, XErrorEvent, XFree, XGetWindowAttributes, XGrabKey, XGrabServer,
-    XKeyPressedEvent, XKeyReleasedEvent, XKeysymToKeycode, XKillClient, XMapRequestEvent,
-    XMapWindow, XNextEvent, XOpenDisplay, XQueryTree, XRemoveFromSaveSet, XReparentEvent,
-    XReparentWindow, XSelectInput, XSetErrorHandler, XSync, XUngrabServer, XUnmapEvent,
-    XUnmapWindow, XWindowAttributes, XWindowChanges,
+    BadAccess, Button1, Button1Mask, ButtonMotionMask, ButtonPress, ButtonPressMask,
+    ButtonReleaseMask, ConfigureNotify, ConfigureRequest, CreateNotify, CurrentTime, DestroyNotify,
+    Display, GrabModeAsync, IsViewable, KeyPress, KeyRelease, MapRequest, Mod1Mask, MotionNotify,
+    ReparentNotify, RevertToPointerRoot, SubstructureNotifyMask, SubstructureRedirectMask,
+    UnmapNotify, Window, XAddToSaveSet, XButtonPressedEvent, XCloseDisplay, XConfigureEvent,
+    XConfigureRequestEvent, XConfigureWindow, XCreateSimpleWindow, XCreateWindowEvent,
+    XDefaultRootWindow, XDestroyWindow, XDestroyWindowEvent, XDisplayName, XDisplayString,
+    XErrorEvent, XFree, XGetGeometry, XGetInputFocus, XGetWindowAttributes, XGrabButton, XGrabKey,
+    XGrabServer, XKeyPressedEvent, XKeyReleasedEvent, XKeysymToKeycode, XKillClient,
+    XMapRequestEvent, XMapWindow, XMotionEvent, XMoveWindow, XNextEvent, XOpenDisplay, XQueryTree,
+    XRaiseWindow, XRemoveFromSaveSet, XReparentEvent, XReparentWindow, XSelectInput,
+    XSetErrorHandler, XSetInputFocus, XSync, XUngrabServer, XUnmapEvent, XUnmapWindow,
+    XWindowAttributes, XWindowChanges, ButtonRelease, XButtonReleasedEvent,
 };
 
+#[derive(Debug)]
 struct ClientList(Vec<(Window, Window)>);
 
 impl ClientList {
     pub fn new() -> Self {
         Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
     pub fn contains(&self, w: &Window) -> bool {
@@ -34,6 +44,10 @@ impl ClientList {
             .enumerate()
             .find(|(_, (win, _))| win == w)
             .map(|(i, _)| i)
+    }
+
+    pub fn index(&self, i: usize) -> Option<(&Window, &Window)> {
+        self.0.get(i).map(|(w, f)| (w, f))
     }
 
     pub fn get(&self, w: &Window) -> Option<&Window> {
@@ -70,6 +84,8 @@ pub struct WindowManager {
     display: NonNull<Display>,
     root: Window,
     clients: ClientList,
+    drag_pos_start: Option<(i32, i32)>,
+    drag_frame_pos: Option<(i32, i32)>,
 }
 
 static WM_DETECTED: AtomicBool = AtomicBool::new(false);
@@ -92,6 +108,8 @@ impl WindowManager {
             display,
             root,
             clients: ClientList::new(),
+            drag_pos_start: None,
+            drag_frame_pos: None,
         }))
     }
 
@@ -153,17 +171,7 @@ impl WindowManager {
             XUngrabServer(self.display.as_ptr());
         }
 
-        unsafe {
-            XGrabKey(
-                self.display.as_ptr(),
-                XKeysymToKeycode(self.display.as_ptr(), XK_space.into()).into(),
-                Mod1Mask,
-                self.root,
-                0,
-                GrabModeAsync,
-                GrabModeAsync,
-            );
-        }
+        self.grab_key(Mod1Mask, XK_space, self.root);
 
         loop {
             let e = unsafe {
@@ -171,8 +179,6 @@ impl WindowManager {
                 XNextEvent(self.display.as_ptr(), e.as_mut_ptr());
                 e.assume_init()
             };
-
-            trace!("Event {}", e.get_type());
 
             #[allow(non_upper_case_globals)]
             match e.get_type() {
@@ -183,6 +189,9 @@ impl WindowManager {
                 CreateNotify => self.on_create_notify(XCreateWindowEvent::from(e)),
                 DestroyNotify => self.on_destroy_notify(XDestroyWindowEvent::from(e)),
                 ReparentNotify => self.on_reparent_notify(XReparentEvent::from(e)),
+                ButtonPress => self.on_button_pressed(XButtonPressedEvent::from(e)),
+                ButtonRelease => self.on_button_released(XButtonReleasedEvent::from(e)),
+                MotionNotify => self.on_motion_notify(XMotionEvent::from(e)),
                 KeyPress => self.on_key_pressed(XKeyPressedEvent::from(e)),
                 KeyRelease => self.on_key_released(XKeyReleasedEvent::from(e)),
                 _ => warn!("Ignored event: {}", e.get_type()),
@@ -190,8 +199,82 @@ impl WindowManager {
         }
     }
 
+    fn on_motion_notify(&mut self, e: XMotionEvent) {
+        assert!(self.clients.contains(&e.window));
+        assert!(self.drag_pos_start.is_some());
+        assert!(self.drag_frame_pos.is_some());
+        let frame = *self.clients.get(&e.window).unwrap();
+        let drag_pos_start = self.drag_pos_start.unwrap();
+        let delta = (e.x_root - drag_pos_start.0, e.y_root - drag_pos_start.1);
+
+        if e.state & Button1Mask != 0 {
+            let start_frame_pos = self.drag_frame_pos.unwrap();
+            let new_frame_pos = (start_frame_pos.0 + delta.0, start_frame_pos.1 + delta.1);
+            unsafe {
+                XMoveWindow(
+                    self.display.as_ptr(),
+                    frame,
+                    new_frame_pos.0,
+                    new_frame_pos.1,
+                );
+            }
+        }
+    }
+
+    fn on_button_pressed(&mut self, e: XButtonPressedEvent) {
+        assert!(self.clients.contains(&e.window));
+        let frame = *self.clients.get(&e.window).unwrap();
+
+        self.drag_pos_start = Some((e.x_root, e.y_root));
+
+        let mut returned_root: Window = 0;
+        let mut x: i32 = 0;
+        let mut y: i32 = 0;
+        let mut width: u32 = 0;
+        let mut height: u32 = 0;
+        let mut border_width: u32 = 0;
+        let mut depth: u32 = 0;
+        unsafe {
+            XGetGeometry(
+                self.display.as_ptr(),
+                frame,
+                &mut returned_root,
+                &mut x,
+                &mut y,
+                &mut width,
+                &mut height,
+                &mut border_width,
+                &mut depth,
+            );
+        }
+        self.drag_frame_pos = Some((x, y));
+
+        unsafe {
+            XRaiseWindow(self.display.as_ptr(), frame);
+            XSetInputFocus(
+                self.display.as_ptr(),
+                e.window,
+                RevertToPointerRoot,
+                CurrentTime,
+            );
+        }
+    }
+
+    fn on_button_released(&mut self, _e: XButtonReleasedEvent) {
+        self.drag_frame_pos = None;
+        self.drag_pos_start = None;
+    }
+
     fn on_key_pressed(&mut self, e: XKeyPressedEvent) {
         info!("key pressed: {}", e.keycode);
+        let mut w = 0;
+        let mut focus_state = 0;
+        unsafe {
+            XGetInputFocus(self.display.as_ptr(), &mut w, &mut focus_state);
+        }
+        trace!("current focused window: {}", w);
+        trace!("event window: {}", e.window);
+        trace!("root window: {}", self.root);
         if e.keycode == unsafe { XKeysymToKeycode(self.display.as_ptr(), XK_Q.into()) }.into() {
             // Kill client
             info!("Killing window {}", e.window);
@@ -201,7 +284,30 @@ impl WindowManager {
         } else if e.state & Mod1Mask != 0
             && e.keycode == unsafe { XKeysymToKeycode(self.display.as_ptr(), XK_Tab.into()) }.into()
         {
-            self.clients.get(&e.window);
+            trace!("clients: {:?}", self.clients);
+            let mut w = 0;
+            let mut focus_state = 0;
+            unsafe {
+                XGetInputFocus(self.display.as_ptr(), &mut w, &mut focus_state);
+            }
+            trace!("current focused window: {}", w);
+            trace!("event window: {}", e.window);
+            trace!("root window: {}", self.root);
+            let i = self.clients.find(&e.window).unwrap();
+            let i = (i + 1) % self.clients.len();
+            let (&w, &f) = self.clients.index(i).unwrap();
+
+            unsafe {
+                XRaiseWindow(self.display.as_ptr(), f);
+                XSetInputFocus(self.display.as_ptr(), w, RevertToPointerRoot, CurrentTime);
+            }
+        } else if e.state & Mod1Mask != 0
+            && e.keycode
+                == unsafe { XKeysymToKeycode(self.display.as_ptr(), XK_space.into()) }.into()
+        {
+            Command::new("/home/ole/dotfiles/bin/dmenu_run_history")
+                .spawn()
+                .unwrap();
         }
     }
 
@@ -253,17 +359,44 @@ impl WindowManager {
             self.clients.insert(w, frame);
 
             // grab events
+            self.grab_key(Mod1Mask, XK_Q, w);
+            self.grab_key(Mod1Mask, XK_Tab, w);
+            self.grab_button(Mod1Mask, Button1, w);
+
+            trace!("Framed window {} [{}]", w, frame);
+        }
+    }
+
+    fn grab_button(&self, modifiers: c_uint, button: c_uint, w: Window) {
+        unsafe {
+            XGrabButton(
+                self.display.as_ptr(),
+                button,
+                modifiers,
+                w,
+                0,
+                (ButtonPressMask | ButtonReleaseMask | ButtonMotionMask)
+                    .try_into()
+                    .unwrap(),
+                GrabModeAsync,
+                GrabModeAsync,
+                0,
+                0,
+            );
+        }
+    }
+
+    fn grab_key(&self, modifiers: c_uint, key_code: c_uint, w: Window) {
+        unsafe {
             XGrabKey(
-                display,
-                XKeysymToKeycode(display, XK_Q.into()).into(),
-                Mod1Mask,
+                self.display.as_ptr(),
+                XKeysymToKeycode(self.display.as_ptr(), key_code.into()).into(),
+                modifiers,
                 w,
                 0,
                 GrabModeAsync,
                 GrabModeAsync,
             );
-
-            trace!("Framed window {} [{}]", w, frame);
         }
     }
 
