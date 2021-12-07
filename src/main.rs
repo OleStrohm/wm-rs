@@ -5,21 +5,21 @@ use std::os::raw::c_uint;
 use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
-use x11::keysym::{XK_Tab, XK_space, XK_Q};
+use x11::keysym::{XK_Tab, XK_space, XK_Q, XK_R};
 use x11::xlib::{
-    BadAccess, Button1, Button1Mask, ButtonMotionMask, ButtonPress, ButtonPressMask,
+    BadAccess, Button1, Button1Mask, ButtonMotionMask, ButtonPress, ButtonPressMask, ButtonRelease,
     ButtonReleaseMask, ConfigureNotify, ConfigureRequest, CreateNotify, CurrentTime, DestroyNotify,
     Display, GrabModeAsync, IsViewable, KeyPress, KeyRelease, MapRequest, Mod1Mask, MotionNotify,
     ReparentNotify, RevertToPointerRoot, SubstructureNotifyMask, SubstructureRedirectMask,
-    UnmapNotify, Window, XAddToSaveSet, XButtonPressedEvent, XCloseDisplay, XConfigureEvent,
-    XConfigureRequestEvent, XConfigureWindow, XCreateSimpleWindow, XCreateWindowEvent,
-    XDefaultRootWindow, XDestroyWindow, XDestroyWindowEvent, XDisplayName, XDisplayString,
-    XErrorEvent, XFree, XGetGeometry, XGetInputFocus, XGetWindowAttributes, XGrabButton, XGrabKey,
-    XGrabServer, XKeyPressedEvent, XKeyReleasedEvent, XKeysymToKeycode, XKillClient,
-    XMapRequestEvent, XMapWindow, XMotionEvent, XMoveWindow, XNextEvent, XOpenDisplay, XQueryTree,
-    XRaiseWindow, XRemoveFromSaveSet, XReparentEvent, XReparentWindow, XSelectInput,
-    XSetErrorHandler, XSetInputFocus, XSync, XUngrabServer, XUnmapEvent, XUnmapWindow,
-    XWindowAttributes, XWindowChanges, ButtonRelease, XButtonReleasedEvent,
+    UnmapNotify, Window, XAddToSaveSet, XButtonPressedEvent, XButtonReleasedEvent, XCloseDisplay,
+    XConfigureEvent, XConfigureRequestEvent, XConfigureWindow, XCreateSimpleWindow,
+    XCreateWindowEvent, XDefaultRootWindow, XDestroyWindow, XDestroyWindowEvent, XDisplayName,
+    XDisplayString, XErrorEvent, XFree, XGetGeometry, XGetInputFocus, XGetWindowAttributes,
+    XGrabButton, XGrabKey, XGrabServer, XKeyPressedEvent, XKeyReleasedEvent, XKeysymToKeycode,
+    XKillClient, XMapRequestEvent, XMapWindow, XMotionEvent, XMoveResizeWindow, XMoveWindow,
+    XNextEvent, XOpenDisplay, XQueryTree, XRaiseWindow, XRemoveFromSaveSet, XReparentEvent,
+    XReparentWindow, XSelectInput, XSetErrorHandler, XSetInputFocus, XSync, XUngrabServer,
+    XUnmapEvent, XUnmapWindow, XWindowAttributes, XWindowChanges,
 };
 
 #[derive(Debug)]
@@ -86,6 +86,7 @@ pub struct WindowManager {
     clients: ClientList,
     drag_pos_start: Option<(i32, i32)>,
     drag_frame_pos: Option<(i32, i32)>,
+    border_width: u32,
 }
 
 static WM_DETECTED: AtomicBool = AtomicBool::new(false);
@@ -110,7 +111,41 @@ impl WindowManager {
             clients: ClientList::new(),
             drag_pos_start: None,
             drag_frame_pos: None,
+            border_width: 3,
         }))
+    }
+
+    pub fn update_windows(&mut self) {
+        let win_count = self.clients.len();
+        if win_count == 0 {
+            return;
+        }
+
+        unsafe {
+            XMoveResizeWindow(
+                self.display.as_ptr(),
+                *self.clients.index(0).unwrap().1,
+                0,
+                0,
+                if win_count == 1 { 800 } else { 400 } - 2 * self.border_width,
+                600 - 2 * self.border_width,
+            );
+        }
+
+        if win_count == 1 {
+            return;
+        }
+
+        let step =
+            (600 - 2 * (win_count as i32 - 1) * self.border_width as i32) / (win_count as i32 - 1);
+        for wi in 1..win_count {
+            let (&w, &f) = self.clients.index(wi).unwrap();
+            let y = step * (wi as i32 - 1) + self.border_width as i32 * 2 * (wi as i32 - 1);
+            unsafe {
+                XMoveResizeWindow(self.display.as_ptr(), f, 400, y, 400 - 2 * self.border_width, step as u32);
+                XMoveResizeWindow(self.display.as_ptr(), w, 0, 0, 400 - 2 * self.border_width, step as u32);
+            }
+        }
     }
 
     pub fn run(mut self) {
@@ -172,6 +207,7 @@ impl WindowManager {
         }
 
         self.grab_key(Mod1Mask, XK_space, self.root);
+        self.grab_key(Mod1Mask, XK_R, self.root);
 
         loop {
             let e = unsafe {
@@ -308,6 +344,11 @@ impl WindowManager {
             Command::new("/home/ole/dotfiles/bin/dmenu_run_history")
                 .spawn()
                 .unwrap();
+        } else if e.state & Mod1Mask != 0
+            && e.keycode == unsafe { XKeysymToKeycode(self.display.as_ptr(), XK_R.into()) }.into()
+        {
+            trace!("Updating window positions/sizes");
+            self.update_windows();
         }
     }
 
@@ -316,7 +357,6 @@ impl WindowManager {
     }
 
     fn frame(&mut self, w: Window, created_before_wm: bool) {
-        const BORDER_WIDTH: u32 = 3;
         const BORDER_COLOR: u64 = 0xFF00FF;
         const BG_COLOR: u64 = 0x0000FF;
 
@@ -343,7 +383,7 @@ impl WindowManager {
                 attributes.y,
                 attributes.width.try_into().unwrap(),
                 attributes.height.try_into().unwrap(),
-                BORDER_WIDTH,
+                self.border_width,
                 BORDER_COLOR,
                 BG_COLOR,
             );
@@ -407,6 +447,8 @@ impl WindowManager {
             XMapWindow(self.display.as_ptr(), e.window);
             trace!("Mapped window {}", e.window);
         }
+
+        self.update_windows();
     }
 
     fn unframe(&mut self, w: Window) {
